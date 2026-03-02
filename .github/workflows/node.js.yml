@@ -50,9 +50,13 @@ jobs:
           k6 run \
             --out json=results/k6-results.json \
             --summary-export=results/k6-summary.json \
+            --out experimental-prometheus-rw \
             tests/load-test.js
         env:
           BASE_URL: http://localhost:3000
+          K6_PROMETHEUS_RW_SERVER_URL: ${{ secrets.GRAFANA_PROMETHEUS_URL }}
+          K6_PROMETHEUS_RW_USERNAME: ${{ secrets.GRAFANA_USERNAME }}
+          K6_PROMETHEUS_RW_PASSWORD: ${{ secrets.GRAFANA_PASSWORD }}
 
       - name: Upload K6 results
         uses: actions/upload-artifact@v4
