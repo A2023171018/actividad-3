@@ -1,36 +1,52 @@
-name: K6 Load Tests
+name: CI/CD Pipeline - Node.js
 
 on:
   push:
     branches: [ "main" ]
-  pull_request:
-    branches: [ "main" ]
-  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
 
 jobs:
-  k6-load-test:
+
+  sonarqube:
+    name: SonarQube Analysis
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: SonarQube Scan
+        uses: SonarSource/sonarqube-scan-action@master
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+      - name: Check Quality Gate
+        uses: SonarSource/sonarqube-quality-gate-action@master
+        timeout-minutes: 5
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
 
+  k6-performance:
+    name: K6 Load Testing
+    needs: [sonarqube]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: '18'
           cache: 'npm'
-
       - name: Install dependencies
         run: npm install --legacy-peer-deps
-
-      - name: Start application server
+      - name: Start server
         run: |
           npm start &
-          sleep 5
+          sleep 8
         env:
           PORT: 3000
-
       - name: Install K6
         run: |
           sudo gpg -k
@@ -41,31 +57,73 @@ jobs:
           echo "deb [signed-by=/usr/share/keyrings/k6-archive-keyring.gpg] \
             https://dl.k6.io/deb stable main" \
             | sudo tee /etc/apt/sources.list.d/k6.list
-          sudo apt-get update
-          sudo apt-get install k6 -y
-
-      - name: Run K6 Load Tests
+          sudo apt-get update && sudo apt-get install k6 -y
+      - name: Run K6
         run: |
           mkdir -p results
           k6 run \
             --out json=results/k6-results.json \
             --summary-export=results/k6-summary.json \
-            --out experimental-prometheus-rw \
             tests/load-test.js
         env:
           BASE_URL: http://localhost:3000
-          K6_PROMETHEUS_RW_SERVER_URL: ${{ secrets.GRAFANA_PROMETHEUS_URL }}
-          K6_PROMETHEUS_RW_USERNAME: ${{ secrets.GRAFANA_USERNAME }}
-          K6_PROMETHEUS_RW_PASSWORD: ${{ secrets.GRAFANA_PASSWORD }}
-
-      - name: Upload K6 results
+      - name: Upload results
         uses: actions/upload-artifact@v4
         if: always()
         with:
           name: k6-test-results
           path: results/
-          retention-days: 30
-
-      - name: Display test summary
+      - name: Show summary
         if: always()
         run: cat results/k6-summary.json
+
+  build-and-push:
+    name: Build and Push Docker Image
+    needs: [k6-performance]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+  deploy:
+    name: Deploy to Production
+    needs: [build-and-push]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            echo ${{ secrets.GITHUB_TOKEN }} | \
+              docker login ghcr.io -u ${{ github.actor }} --password-stdin
+            docker stop my-node-app || true
+            docker rm   my-node-app || true
+            docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:main
+            docker run -d \
+              --name my-node-app \
+              -p 80:3000 \
+              --restart always \
+              ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:main
