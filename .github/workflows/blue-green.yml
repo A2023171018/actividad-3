@@ -1,1 +1,54 @@
 
+name: Blue-Green Deployment
+
+on:
+  push:
+    branches: [ main ]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout código
+        uses: actions/checkout@v3
+
+      - name: Configurar SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H ${{ secrets.SERVER_HOST }} >> ~/.ssh/known_hosts
+
+      - name: Ejecutar despliegue Blue-Green
+        run: |
+          ssh -i ~/.ssh/id_ed25519 ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }} << 'ENDSSH'
+            # Leer estado actual
+            source /etc/nginx/current_deploy.env
+
+            # Lógica de inversión
+            if [ "$CURRENT_COLOR" = "blue" ]; then
+              TARGET_COLOR="green"
+              export APP_TARGET_IP="10.0.2.2"
+              export APP_TARGET_PORT="8081"
+            else
+              TARGET_COLOR="blue"
+              export APP_TARGET_IP="10.0.2.2"
+              export APP_TARGET_PORT="8080"
+            fi
+
+            export DEPLOYMENT_COLOR=$TARGET_COLOR
+
+            # Aplicar envsubst
+            envsubst '${APP_TARGET_IP} ${APP_TARGET_PORT} ${DEPLOYMENT_COLOR}' \
+              < ${{ secrets.NGINX_TEMPLATE_PATH }} \
+              > /etc/nginx/conf.d/default.conf
+
+            # Validar y recargar
+            sudo nginx -t && sudo systemctl reload nginx
+
+            # Actualizar estado
+            echo "CURRENT_COLOR=$TARGET_COLOR" | sudo tee /etc/nginx/current_deploy.env
+
+            echo "Despliegue completado: $TARGET_COLOR"
+          ENDSSH
